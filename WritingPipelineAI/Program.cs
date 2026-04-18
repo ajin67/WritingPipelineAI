@@ -195,10 +195,10 @@ class Program
 
     static async Task<Conversation> RunAgentAsync(TornadoAgent agent, string input)
     {
-        MethodInfo? runAsyncMethod = agent.GetType().GetMethod("RunAsync", new[] { typeof(string) });
+        MethodInfo? runAsyncMethod = FindAgentMethod(agent.GetType(), "RunAsync");
         if (runAsyncMethod is not null)
         {
-            object? asyncResult = runAsyncMethod.Invoke(agent, new object?[] { input });
+            object? asyncResult = runAsyncMethod.Invoke(agent, BuildInvocationArguments(runAsyncMethod, input));
             if (asyncResult is Task<Conversation> typedTask)
             {
                 return await typedTask;
@@ -215,10 +215,10 @@ class Program
             }
         }
 
-        MethodInfo? runMethod = agent.GetType().GetMethod("Run", new[] { typeof(string) });
+        MethodInfo? runMethod = FindAgentMethod(agent.GetType(), "Run");
         if (runMethod is not null)
         {
-            object? runResult = runMethod.Invoke(agent, new object?[] { input });
+            object? runResult = runMethod.Invoke(agent, BuildInvocationArguments(runMethod, input));
             if (runResult is Conversation directConversation)
             {
                 return directConversation;
@@ -240,6 +240,45 @@ class Program
             }
         }
 
-        throw new MissingMethodException("TornadoAgent does not expose RunAsync(string) or Run(string).");
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine("Could not find a compatible TornadoAgent Run/RunAsync method.");
+        Console.ResetColor();
+        return new Conversation();
+    }
+
+    static MethodInfo? FindAgentMethod(Type agentType, string methodName)
+    {
+        return agentType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+            .FirstOrDefault(m =>
+            {
+                if (!string.Equals(m.Name, methodName, StringComparison.Ordinal))
+                    return false;
+
+                ParameterInfo[] parameters = m.GetParameters();
+                return parameters.Length >= 1 && parameters[0].ParameterType == typeof(string);
+            });
+    }
+
+    static object?[] BuildInvocationArguments(MethodInfo method, string input)
+    {
+        ParameterInfo[] parameters = method.GetParameters();
+        object?[] args = new object?[parameters.Length];
+        args[0] = input;
+
+        for (int i = 1; i < parameters.Length; i++)
+        {
+            if (parameters[i].HasDefaultValue)
+            {
+                args[i] = parameters[i].DefaultValue;
+            }
+            else
+            {
+                Type pType = parameters[i].ParameterType;
+                args[i] = pType.IsValueType ? Activator.CreateInstance(pType) : null;
+            }
+        }
+
+        return args;
     }
 }
