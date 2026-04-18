@@ -1,5 +1,8 @@
-﻿using LlmTornado;
+﻿using System.Text;
+using System.Text.RegularExpressions;
+using LlmTornado;
 using LlmTornado.Agents;
+using LlmTornado.Chat;
 using LlmTornado.Chat.Models;
 
 public class EditorialReview
@@ -21,6 +24,10 @@ class Program
         TornadoAgent writer = CreateWriterAgent(api);
         TornadoAgent editor = CreateEditorAgent(api);
 
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("Writing Pipeline AI - Writer + Editor");
+        Console.ResetColor();
+
         while (true)
         {
             Console.Write("Enter a writing task (/exit to quit): ");
@@ -32,13 +39,87 @@ class Program
             if (task.Equals("/exit", StringComparison.OrdinalIgnoreCase))
                 break;
 
-            // TODO:
             // 1. Ask the writer for a first draft
-            // 2. Ask the editor to review the draft
-            // 3. Parse the editor response into STATUS, RATIONALE, and REVISION TASKS
-            // 4. If STATUS is REVISE, ask the writer to revise the draft
-            // 5. Repeat until STATUS is READY or max rounds reached
-            // 6. Display the final approved draft or the most recent draft
+            Conversation writerConversation = await writer.RunAsync($"Task: {task}\n\nCreate the first draft.");
+            string currentDraft = writerConversation.Messages.LastOrDefault()?.Content?.Trim() ?? "";
+
+            int revisionRounds = 0;
+            int draftRound = 1;
+
+            StringBuilder transcript = new();
+            transcript.AppendLine($"Task: {task}");
+            transcript.AppendLine();
+
+            while (true)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n--- DRAFT: ROUND {draftRound} ---");
+                Console.ResetColor();
+                Console.WriteLine(currentDraft);
+
+                transcript.AppendLine($"--- DRAFT: ROUND {draftRound} ---");
+                transcript.AppendLine(currentDraft);
+                transcript.AppendLine();
+
+                // 2. Ask the editor to review the draft
+                Conversation editorConversation = await editor.RunAsync(
+                    $"Task: {task}\n\nDraft:\n{currentDraft}\n\nReview using the required format.");
+                string editorResponse = editorConversation.Messages.LastOrDefault()?.Content?.Trim() ?? "";
+
+                // 3. Parse the editor response into STATUS, RATIONALE, and REVISION TASKS
+                EditorialReview review = ParseReview(editorResponse);
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("\n--- EDITOR RESPONSE ---");
+                Console.ResetColor();
+                Console.WriteLine(editorResponse);
+
+                transcript.AppendLine("--- EDITOR RESPONSE ---");
+                transcript.AppendLine(editorResponse);
+                transcript.AppendLine();
+
+                // 5. Repeat until STATUS is READY or max rounds reached
+                if (review.Status.Equals("READY", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine("\n--- FINAL APPROVED DRAFT ---");
+                    Console.ResetColor();
+                    Console.WriteLine(currentDraft);
+
+                    transcript.AppendLine("--- FINAL APPROVED DRAFT ---");
+                    transcript.AppendLine(currentDraft);
+                    break;
+                }
+
+                if (revisionRounds >= 3)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("\n--- MAX REVISION ROUNDS REACHED ---");
+                    Console.ResetColor();
+                    Console.WriteLine(currentDraft);
+
+                    transcript.AppendLine("--- MAX REVISION ROUNDS REACHED ---");
+                    transcript.AppendLine(currentDraft);
+                    break;
+                }
+
+                // 4. If STATUS is REVISE, ask the writer to revise the draft
+                string revisionTasks = review.RevisionTasks.Count > 0
+                    ? string.Join(Environment.NewLine, review.RevisionTasks.Select((t, i) => $"{i + 1}. {t}"))
+                    : "1. Improve clarity for beginners.\n2. Add one short C# example.\n3. Strengthen flow and organization.";
+
+                Conversation revisedConversation = await writer.RunAsync(
+                    $"Task: {task}\n\nCurrent draft:\n{currentDraft}\n\nRevise using these tasks:\n{revisionTasks}\n\nReturn only the revised draft.");
+
+                currentDraft = revisedConversation.Messages.LastOrDefault()?.Content?.Trim() ?? currentDraft;
+                revisionRounds++;
+                draftRound++;
+            }
+
+            string outputPath = SaveOutput(transcript.ToString());
+            Console.ForegroundColor = ConsoleColor.DarkGreen;
+            Console.WriteLine($"\nSaved output to: {outputPath}\n");
+            Console.ResetColor();
         }
     }
 
@@ -48,21 +129,66 @@ class Program
         client: api,
         model: new ChatModel("google/gemma-3-4b"),
         instructions: """
-		 You are a writing assistant... FINISH MY INSTRUCTIONS PROMPT
-		 """
+         You are a writing assistant for beginner readers. Write a clear, organized draft based on the user's request.
+         Use simple language, stay focused on the topic, and keep the writing concise. Output only the draft.
+         """
        );
         return writer;
     }
 
     static TornadoAgent CreateEditorAgent(TornadoApi api)
     {
-        // TODO: return a configured Editor agent
-        throw new NotImplementedException();
+        return new TornadoAgent(
+            client: api,
+            model: new ChatModel("google/gemma-3-4b"),
+            instructions: """
+                You are an editor reviewing writing for beginner readers. Decide whether the draft is ready.
+                Your response must follow this exact format:
+                STATUS: READY or REVISE
+                RATIONALE: Write 1 short paragraph explaining your decision.
+                REVISION TASKS: If the status is REVISE, provide exactly 3 specific revision tasks as a numbered list.
+                If the status is READY, do not include revision tasks.
+                """
+        );
     }
 
     static EditorialReview ParseReview(string editorResponse)
     {
-        // TODO: extract STATUS, RATIONALE, and REVISION TASKS
-        throw new NotImplementedException();
+        EditorialReview review = new();
+
+        Match statusMatch = Regex.Match(editorResponse, @"STATUS\s*:\s*(READY|REVISE)", RegexOptions.IgnoreCase);
+        review.Status = statusMatch.Success ? statusMatch.Groups[1].Value.ToUpperInvariant() : "REVISE";
+
+        Match rationaleMatch = Regex.Match(
+            editorResponse,
+            @"RATIONALE\s*:\s*(?<rationale>[\s\S]*?)(?:\n\s*REVISION TASKS\s*:|$)",
+            RegexOptions.IgnoreCase);
+
+        if (rationaleMatch.Success)
+        {
+            review.Rationale = rationaleMatch.Groups["rationale"].Value.Trim();
+        }
+
+        Match tasksSection = Regex.Match(editorResponse, @"REVISION TASKS\s*:\s*(?<tasks>[\s\S]*)$", RegexOptions.IgnoreCase);
+        if (tasksSection.Success)
+        {
+            review.RevisionTasks = Regex.Matches(tasksSection.Groups["tasks"].Value, @"^\s*\d+[\.)]\s*(.+)$", RegexOptions.Multiline)
+                .Select(m => m.Groups[1].Value.Trim())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Take(3)
+                .ToList();
+        }
+
+        return review;
+    }
+
+    static string SaveOutput(string content)
+    {
+        string outputDir = Path.Combine(AppContext.BaseDirectory, "outputs");
+        Directory.CreateDirectory(outputDir);
+
+        string filePath = Path.Combine(outputDir, $"session_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+        File.WriteAllText(filePath, content);
+        return filePath;
     }
 }
